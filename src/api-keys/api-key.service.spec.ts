@@ -108,4 +108,67 @@ describe('ApiKeyService', () => {
       ServiceUnavailableException,
     );
   });
+
+  describe('offline verifier gating', () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+
+    afterEach(() => {
+      if (originalNodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = originalNodeEnv;
+      }
+    });
+
+    function buildGatedService(nodeEnv: string | undefined): {
+      service: ApiKeyService;
+      store: StubApiKeyStore;
+    } {
+      if (nodeEnv === undefined) {
+        delete process.env.NODE_ENV;
+      } else {
+        process.env.NODE_ENV = nodeEnv;
+      }
+      const gatedStore = new StubApiKeyStore();
+      gatedStore.findUnique.mockResolvedValue(null);
+      const gatedService = new ApiKeyService(
+        gatedStore as never,
+        makeConfig(),
+      );
+      return { service: gatedService, store: gatedStore };
+    }
+
+    it('rejects an unknown key under NODE_ENV=production', async () => {
+      const { service: gated } = buildGatedService('production');
+      await expect(gated.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+    });
+
+    it('rejects an unknown key under NODE_ENV=staging', async () => {
+      const { service: gated } = buildGatedService('staging');
+      await expect(gated.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+    });
+
+    it('rejects an unknown key when NODE_ENV is unset', async () => {
+      const { service: gated } = buildGatedService(undefined);
+      await expect(gated.validateApiKey('mux_test_unknown')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+    });
+
+    it('allows a mux_test_ prefixed key under NODE_ENV=test', async () => {
+      const { service: gated } = buildGatedService('test');
+      const context = await gated.validateApiKey('mux_test_offline');
+      expect(context).toBeDefined();
+    });
+
+    it('treats whitespace/case NODE_ENV=" TEST " as test', async () => {
+      const { service: gated } = buildGatedService(' TEST ');
+      const context = await gated.validateApiKey('mux_test_offline');
+      expect(context).toBeDefined();
+    });
+  });
 });
