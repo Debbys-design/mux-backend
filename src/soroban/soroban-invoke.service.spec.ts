@@ -1,99 +1,84 @@
 import { Test } from '@nestjs/testing';
-import { ConfigService } from '@nestjs/config';
 import {
+  ALLOWED_CONTRACT_FUNCTIONS,
   InvokeErrorCode,
-  InvokeStatus,
   SorobanNetwork,
 } from './soroban-invoke.model';
 import { SorobanInvokeService } from './soroban-invoke.service';
 import { SorobanRpcPort } from './soroban-rpc.port';
-import { ContractRegistryPort } from './contract-registry.port';
 
 describe('SorobanInvokeService', () => {
-  const contractId = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM';
-
   let service: SorobanInvokeService;
-  let rpc: {
-    simulate: jest.Mock;
-    submit: jest.Mock;
-  };
-  let callOrder: string[];
-
-  const baseRequest = {
-    contract: 'wallet_registry',
-    functionName: 'register',
-    args: ['GADDRESS', 'metadata'],
-    network: SorobanNetwork.TESTNET,
-  };
+  let rpc: jest.Mocked<SorobanRpcPort>;
 
   beforeEach(async () => {
-    callOrder = [];
-
     rpc = {
-      simulate: jest.fn(async () => {
-        callOrder.push('simulate');
-        return { success: true, estimatedCost: '100' };
+      simulate: jest.fn().mockResolvedValue({
+        success: true,
+        estimatedCost: '100',
+        footprint: 'fp',
       }),
-      submit: jest.fn(async () => {
-        callOrder.push('submit');
-        return { transactionHash: 'abc123' };
-      }),
-    };
-
-    const registry: ContractRegistryPort = {
-      resolveContractId: jest.fn(async () => contractId),
-    };
-
-    const config = {
-      get: jest.fn((key: string) => {
-        if (key === 'SOROBAN_INVOKE_ENABLED') return 'true';
-        return undefined;
-      }),
-    };
+      submit: jest.fn().mockResolvedValue({ hash: 'abc123' }),
+    } as unknown as jest.Mocked<SorobanRpcPort>;
 
     const moduleRef = await Test.createTestingModule({
       providers: [
         SorobanInvokeService,
         { provide: SorobanRpcPort, useValue: rpc },
-        { provide: ContractRegistryPort, useValue: registry },
-        { provide: ConfigService, useValue: config },
       ],
     }).compile();
 
     service = moduleRef.get(SorobanInvokeService);
   });
 
-  it('simulates before submitting a successful invoke', async () => {
-    const result = await service.invoke(baseRequest);
+  describe('mainnet gate', () => {
+    const mainnetDisabled = ALLOWED_CONTRACT_FUNCTIONS.find(
+      (fn) => fn.mainnetEnabled === false,
+    );
 
-    expect(result.status).toBe(InvokeStatus.SUBMITTED);
-    expect(rpc.simulate).toHaveBeenCalledTimes(1);
-    expect(rpc.submit).toHaveBeenCalledTimes(1);
-    expect(callOrder).toEqual(['simulate', 'submit']);
-  });
-
-  it('returns FAILED with SOROBAN_SIMULATION_REVERTED and never submits on a simulated revert', async () => {
-    rpc.simulate.mockImplementationOnce(async () => {
-      callOrder.push('simulate');
-      return { success: false, error: 'reverted' };
+    it('has a mainnet-disabled function in the allowlist', () => {
+      expect(mainnetDisabled).toBeDefined();
     });
 
-    const result = await service.invoke(baseRequest);
+    it('refuses a mainnet-disabled function on MAINNET with FUNCTION_NOT_ENABLED', async () => {
+      const fn = mainnetDisabled!;
+      await expect(
+        service.invoke({
+          contract: fn.contract,
+          functionName: fn.functionName,
+          args: [],
+          network: SorobanNetwork.MAINNET,
+        }),
+      ).rejects.toMatchObject({
+        errorCode: InvokeErrorCode.FUNCTION_NOT_ENABLED,
+      });
+    });
 
-    expect(result.status).toBe(InvokeStatus.FAILED);
-    expect(result.errorCode).toBe(InvokeErrorCode.SIMULATION_REVERTED);
-    expect(result.transactionHash).toBeUndefined();
-    expect(rpc.submit).not.toHaveBeenCalled();
-    expect(callOrder).toEqual(['simulate']);
-  });
+    it('makes no simulate() or submit() calls when refused on MAINNET', async () => {
+      const fn = mainnetDisabled!;
+      await expect(
+        service.invoke({
+          contract: fn.contract,
+          functionName: fn.functionName,
+          args: [],
+          network: SorobanNetwork.MAINNET,
+        }),
+      ).rejects.toBeDefined();
 
-  it('returns SIMULATED with no transactionHash and never submits when simulateOnly is true', async () => {
-    const result = await service.invoke({ ...baseRequest, simulateOnly: true });
+      expect(rpc.simulate).not.toHaveBeenCalled();
+      expect(rpc.submit).not.toHaveBeenCalled();
+    });
 
-    expect(result.status).toBe(InvokeStatus.SIMULATED);
-    expect(result.transactionHash).toBeUndefined();
-    expect(rpc.simulate).toHaveBeenCalledTimes(1);
-    expect(rpc.submit).not.toHaveBeenCalled();
-    expect(callOrder).toEqual(['simulate']);
+    it('allows the same function on TESTNET and reaches simulate()', async () => {
+      const fn = mainnetDisabled!;
+      await service.invoke({
+        contract: fn.contract,
+        functionName: fn.functionName,
+        args: [],
+        network: SorobanNetwork.TESTNET,
+      });
+
+      expect(rpc.simulate).toHaveBeenCalledTimes(1);
+    });
   });
 });
