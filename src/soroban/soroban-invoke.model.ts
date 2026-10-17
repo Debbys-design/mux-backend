@@ -32,6 +32,19 @@ export const SorobanNetwork = {
 export type SorobanNetwork =
   (typeof SorobanNetwork)[keyof typeof SorobanNetwork];
 
+/**
+ * Narrows an arbitrary value to a `SorobanNetwork` member.
+ *
+ * Used to validate untrusted input (e.g. a `network` query parameter) before it
+ * reaches the service layer, so the service only ever sees a real enum member.
+ */
+export function isSorobanNetwork(value: unknown): value is SorobanNetwork {
+  return (
+    typeof value === 'string' &&
+    (Object.values(SorobanNetwork) as string[]).includes(value)
+  );
+}
+
 /** A contract function the backend is willing to invoke. */
 export interface AllowedContractFunction {
   /** Contract name, as registered in the allowlist. */

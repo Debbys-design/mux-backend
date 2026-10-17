@@ -8,6 +8,7 @@ import {
   MAX_RPC_ATTEMPTS,
   MAX_RPC_BACKOFF_MS,
   resolveSorobanRpcRetryPolicy,
+  SorobanRpcRetryErrorCode,
   statusCodeOf,
   withSorobanRpcRetry,
 } from './soroban-rpc-retry';
@@ -305,6 +306,50 @@ describe('Soroban RPC retry policy (#953)', () => {
       expect(result.outcome).toBe('exhausted');
       expect(fn).toHaveBeenCalledTimes(1);
       expect(delays).toEqual([]);
+    });
+
+    it('stops retrying and rejects with SOROBAN_RPC_RETRY_ABORTED when the signal aborts mid-retry', async () => {
+      const { sleep } = fakeSleep();
+      const controller = new AbortController();
+      const fn = jest.fn().mockImplementation(() => {
+        controller.abort();
+        return Promise.reject(transient());
+      });
+
+      await expect(
+        withSorobanRpcRetry(fn, {
+          policy: POLICY,
+          retryable: true,
+          operation: 'simulate',
+          signal: controller.signal,
+          sleep,
+          random: () => 1,
+        }),
+      ).rejects.toMatchObject({
+        errorCode: SorobanRpcRetryErrorCode.ABORTED,
+      });
+
+      // No further attempts are made once the signal has aborted.
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects with SOROBAN_RPC_RETRY_EXHAUSTED after exactly maxAttempts calls', async () => {
+      const { sleep } = fakeSleep();
+      const fn = jest.fn().mockRejectedValue(transient());
+
+      await expect(
+        withSorobanRpcRetry(fn, {
+          policy: POLICY,
+          retryable: true,
+          operation: 'simulate',
+          sleep,
+          random: () => 1,
+        }),
+      ).rejects.toMatchObject({
+        errorCode: SorobanRpcRetryErrorCode.EXHAUSTED,
+      });
+
+      expect(fn).toHaveBeenCalledTimes(POLICY.maxAttempts);
     });
   });
 });

@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -17,6 +18,7 @@ import type {
   InvokeRequest,
   InvokeResult,
 } from './soroban-invoke.model';
+import { InvokeSorobanDto } from './dto/invoke-soroban.dto';
 import { resolveRequestId } from '../common/interceptors/request-id.interceptor';
 
 /**
@@ -42,10 +44,34 @@ export class SorobanInvokeController {
    */
   @Get('contracts')
   @UseGuards(ApiKeyGuard)
-  listContracts(
-    @Query('network') network: SorobanNetwork = SorobanNetwork.TESTNET,
-  ) {
-    return { network, functions: this.soroban.listAllowedFunctions(network) };
+  listContracts(@Query('network') network?: string) {
+    const resolved = this.resolveNetwork(network);
+    return {
+      network: resolved,
+      functions: this.soroban.listAllowedFunctions(resolved),
+    };
+  }
+
+  /**
+   * Validates the `network` query parameter against `SorobanNetwork`.
+   *
+   * Absent parameter defaults to `TESTNET`. Any value that is not a member of
+   * the enum is rejected with HTTP 400 and a stable `errorCode` so a client can
+   * distinguish "no functions on this network" from "you typed the network
+   * wrong".
+   */
+  private resolveNetwork(network: string | undefined): SorobanNetwork {
+    if (network === undefined || network === null || network === '') {
+      return SorobanNetwork.TESTNET;
+    }
+    const members = Object.values(SorobanNetwork) as string[];
+    if (!members.includes(network)) {
+      throw new BadRequestException({
+        errorCode: 'SOROBAN_INVALID_NETWORK',
+        message: `Invalid network '${network}'. Expected one of: ${members.join(', ')}.`,
+      });
+    }
+    return network as SorobanNetwork;
   }
 
   /**
@@ -60,7 +86,7 @@ export class SorobanInvokeController {
   @HttpCode(HttpStatus.OK)
   @UseGuards(ApiKeyGuard)
   async invoke(
-    @Body() body: Omit<InvokeRequest, 'correlationId'>,
+    @Body() body: InvokeSorobanDto,
     @Headers('x-request-id') correlationId?: string,
   ): Promise<InvokeResult> {
     return this.soroban.invoke(
