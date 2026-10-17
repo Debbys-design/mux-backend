@@ -175,7 +175,10 @@ export class WalletService {
 
       // Uniqueness: map the unique-constraint violation (including the race
       // between concurrent registrations) to a stable, typed error code.
-      if (this.isUniqueConstraintError(err)) {
+      // Only violations targeting the wallet address column are mapped; a
+      // P2002 on any other unique column (or a non-P2002 error) is rethrown
+      // so it is not misreported as a duplicate address.
+      if (this.isWalletAddressUniqueViolation(err)) {
         this.logger.warn(
           `wallet.register duplicate address=${this.redactAddress(input.address)} correlationId=${correlationId}`,
         );
@@ -188,6 +191,27 @@ export class WalletService {
 
       throw err;
     }
+  }
+
+  /**
+   * Detect a Prisma unique-constraint violation (P2002) scoped to the wallet
+   * address column. Returns false for any other error so callers rethrow.
+   */
+  private isWalletAddressUniqueViolation(err: unknown): boolean {
+    if (!(err instanceof Prisma.PrismaClientKnownRequestError)) {
+      return false;
+    }
+    if (err.code !== 'P2002') {
+      return false;
+    }
+    const target = (err.meta as { target?: unknown } | undefined)?.target;
+    if (target === undefined || target === null) {
+      return false;
+    }
+    const fields = Array.isArray(target) ? target : [target];
+    return fields.some(
+      (field) => typeof field === 'string' && field.toLowerCase() === 'address',
+    );
   }
 
   /**
@@ -249,4 +273,27 @@ export class WalletService {
             code: WalletSuccessorErrorCode.WALLET_NOT_FOUND,
             message: `Wallet ${walletId} not f
 
-/* … truncated 979 chars — edit only what you need near the top … */
+        // Authorization: owner must match, or caller must be an authorized
+        // delegate/guardian recorded on the wallet.
+        if (actor.role === 'owner' && wallet.ownerId !== actor.subjectId) {
+          throw new ForbiddenException({
+            code: WalletSuccessorErrorCode.NOT_AUTHORIZED,
+            message: 'Caller does not own this wallet',
+            correlationId,
+          });
+        }
+        if (actor.role !== 'owner') {
+          const authorized = await this.isAuthorizedDelegate(
+            tx,
+            walletId,
+            actor.subjectId,
+            actor.role,
+          );
+          if (!authorized) {
+            throw new ForbiddenException({
+              code: WalletSuccessorErrorCode.NOT_AUTHORIZED,
+              message: 'Delegate/guardian is not authorized for this wallet',
+              correlationId,
+            });
+          }
+        }
