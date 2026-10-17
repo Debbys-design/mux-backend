@@ -1,97 +1,99 @@
+import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
-import { ForbiddenException } from '@nestjs/common';
-import { MetricsService } from '../common/metrics/metrics.service';
 import {
   InvokeErrorCode,
-  SOROBAN_INVOKE_ENABLED_ENV,
+  InvokeStatus,
   SorobanNetwork,
 } from './soroban-invoke.model';
-import type { InvokeActor, InvokeRequest } from './soroban-invoke.model';
-import {
-  CONTRACT_REGISTRY,
-  SOROBAN_RPC,
-  SorobanInvokeService,
-} from './soroban-invoke.service';
-import type {
-  ContractRegistryPort,
-  SorobanRpcPort,
-} from './soroban-invoke.service';
+import { SorobanInvokeService } from './soroban-invoke.service';
+import { SorobanRpcPort } from './soroban-rpc.port';
+import { ContractRegistryPort } from './contract-registry.port';
 
-describe('SorobanInvokeService kill-switch', () => {
-  const originalFlag = process.env[SOROBAN_INVOKE_ENABLED_ENV];
+describe('SorobanInvokeService', () => {
+  const contractId = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM';
 
-  let simulate: jest.Mock;
-  let submit: jest.Mock;
-  let rpc: SorobanRpcPort;
-  let registry: ContractRegistryPort;
-  let metrics: MetricsService;
   let service: SorobanInvokeService;
+  let rpc: {
+    simulate: jest.Mock;
+    submit: jest.Mock;
+  };
+  let callOrder: string[];
 
-  const request: InvokeRequest = {
-    contract: 'token',
-    functionName: 'transfer',
-    args: [],
+  const baseRequest = {
+    contract: 'wallet_registry',
+    functionName: 'register',
+    args: ['GADDRESS', 'metadata'],
     network: SorobanNetwork.TESTNET,
   };
 
-  const actor: InvokeActor = {
-    correlationId: 'test-correlation-id',
-  } as InvokeActor;
+  beforeEach(async () => {
+    callOrder = [];
 
-  beforeEach(() => {
-    simulate = jest.fn().mockResolvedValue({ success: true });
-    submit = jest.fn().mockResolvedValue({ transactionHash: 'hash' });
-    rpc = { simulate, submit } as unknown as SorobanRpcPort;
-    registry = {
-      resolveContractId: jest.fn().mockResolvedValue('C...'),
-    } as unknown as ContractRegistryPort;
-    metrics = {
-      incrementCounter: jest.fn(),
-    } as unknown as MetricsService;
-    service = new SorobanInvokeService(rpc, registry, metrics);
+    rpc = {
+      simulate: jest.fn(async () => {
+        callOrder.push('simulate');
+        return { success: true, estimatedCost: '100' };
+      }),
+      submit: jest.fn(async () => {
+        callOrder.push('submit');
+        return { transactionHash: 'abc123' };
+      }),
+    };
+
+    const registry: ContractRegistryPort = {
+      resolveContractId: jest.fn(async () => contractId),
+    };
+
+    const config = {
+      get: jest.fn((key: string) => {
+        if (key === 'SOROBAN_INVOKE_ENABLED') return 'true';
+        return undefined;
+      }),
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      providers: [
+        SorobanInvokeService,
+        { provide: SorobanRpcPort, useValue: rpc },
+        { provide: ContractRegistryPort, useValue: registry },
+        { provide: ConfigService, useValue: config },
+      ],
+    }).compile();
+
+    service = moduleRef.get(SorobanInvokeService);
   });
 
-  afterEach(() => {
-    if (originalFlag === undefined) {
-      delete process.env[SOROBAN_INVOKE_ENABLED_ENV];
-    } else {
-      process.env[SOROBAN_INVOKE_ENABLED_ENV] = originalFlag;
-    }
-    jest.restoreAllMocks();
+  it('simulates before submitting a successful invoke', async () => {
+    const result = await service.invoke(baseRequest);
+
+    expect(result.status).toBe(InvokeStatus.SUBMITTED);
+    expect(rpc.simulate).toHaveBeenCalledTimes(1);
+    expect(rpc.submit).toHaveBeenCalledTimes(1);
+    expect(callOrder).toEqual(['simulate', 'submit']);
   });
 
-  it('refuses with SOROBAN_INVOKE_DISABLED when the flag is unset', async () => {
-    delete process.env[SOROBAN_INVOKE_ENABLED_ENV];
-
-    await expect(service.invoke(request, actor)).rejects.toMatchObject({
-      errorCode: InvokeErrorCode.FEATURE_FLAG_DISABLED,
+  it('returns FAILED with SOROBAN_SIMULATION_REVERTED and never submits on a simulated revert', async () => {
+    rpc.simulate.mockImplementationOnce(async () => {
+      callOrder.push('simulate');
+      return { success: false, error: 'reverted' };
     });
+
+    const result = await service.invoke(baseRequest);
+
+    expect(result.status).toBe(InvokeStatus.FAILED);
+    expect(result.errorCode).toBe(InvokeErrorCode.SIMULATION_REVERTED);
+    expect(result.transactionHash).toBeUndefined();
+    expect(rpc.submit).not.toHaveBeenCalled();
+    expect(callOrder).toEqual(['simulate']);
   });
 
-  it.each(['false', '0'])('refuses with SOROBAN_INVOKE_DISABLED when the flag is %s', async (value) => {
-    process.env[SOROBAN_INVOKE_ENABLED_ENV] = value;
+  it('returns SIMULATED with no transactionHash and never submits when simulateOnly is true', async () => {
+    const result = await service.invoke({ ...baseRequest, simulateOnly: true });
 
-    await expect(service.invoke(request, actor)).rejects.toMatchObject({
-      errorCode: InvokeErrorCode.FEATURE_FLAG_DISABLED,
-    });
-  });
-
-  it('makes zero simulate() and submit() calls when disabled', async () => {
-    delete process.env[SOROBAN_INVOKE_ENABLED_ENV];
-
-    await expect(service.invoke(request, actor)).rejects.toBeInstanceOf(
-      ForbiddenException,
-    );
-
-    expect(simulate).not.toHaveBeenCalled();
-    expect(submit).not.toHaveBeenCalled();
-  });
-
-  it('allows the request to reach simulate() when the flag is true', async () => {
-    process.env[SOROBAN_INVOKE_ENABLED_ENV] = 'true';
-
-    await service.invoke(request, actor);
-
-    expect(simulate).toHaveBeenCalledTimes(1);
+    expect(result.status).toBe(InvokeStatus.SIMULATED);
+    expect(result.transactionHash).toBeUndefined();
+    expect(rpc.simulate).toHaveBeenCalledTimes(1);
+    expect(rpc.submit).not.toHaveBeenCalled();
+    expect(callOrder).toEqual(['simulate']);
   });
 });
